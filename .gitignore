@@ -1,0 +1,16 @@
+# Environment secrets (crucial to exclude)
+.env
+*_env
+
+# Node.js dependencies & builds
+node_modules/
+.next/
+*.zip
+
+# Python environments & cache
+venv/
+__pycache__/
+*.pyc
+
+# IDE local settings
+.vscode/
