@@ -1,0 +1,237 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-background: #070B10;
+    --bg-sidebar: #0B1017;
+    --bg-surface: #101820;
+    --bg-surface-elevated: #15202A;
+    --border-color: #222F3E;
+    --text-primary: #F8FAFC;
+    --text-secondary: #A8B6C7;
+    --accent-color: #BEFF53;
+    --accent-subtle: rgba(190, 255, 83, 0.12);
+    --accent-glow: rgba(190, 255, 83, 0.28);
+    --secondary-glow: #00E5C3;
+    --secondary-subtle: rgba(0, 229, 195, 0.12);
+    --amber-clarification: #FFB547;
+    --amber-subtle: rgba(255, 181, 71, 0.12);
+    --violet-speculative: #A78BFA;
+    --violet-subtle: rgba(167, 139, 250, 0.12);
+    --error-red: #FF6975;
+    --error-subtle: rgba(255, 105, 117, 0.12);
+    --ring-color: #BEFF53;
+  }
+
+  .light {
+    --bg-background: #F4F5F7;
+    --bg-sidebar: #ECEEF2;
+    --bg-surface: #FFFFFF;
+    --bg-surface-elevated: #F1F3F6;
+    --border-color: #D6DAE1;
+    --text-primary: #0E1217;
+    --text-secondary: #5F6876;
+    --accent-color: #2E6B05;
+    --accent-subtle: rgba(46, 107, 5, 0.1);
+    --accent-glow: rgba(46, 107, 5, 0.2);
+    --amber-clarification: #B46B00;
+    --amber-subtle: rgba(180, 107, 0, 0.1);
+    --violet-speculative: #6347D1;
+    --violet-subtle: rgba(99, 71, 209, 0.1);
+    --error-red: #D92534;
+    --error-subtle: rgba(217, 37, 52, 0.1);
+    --ring-color: #2E6B05;
+  }
+
+  body {
+    background-color: var(--bg-background);
+    color: var(--text-primary);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Custom Semantic Background and Text Utilities */
+.bg-app-bg {
+  background-color: var(--bg-background);
+}
+.bg-app-sidebar {
+  background-color: var(--bg-sidebar);
+}
+.bg-app-surface {
+  background-color: var(--bg-surface);
+}
+.bg-app-elevated {
+  background-color: var(--bg-surface-elevated);
+}
+.border-app-border {
+  border-color: var(--border-color);
+}
+.text-app-primary {
+  color: var(--text-primary);
+}
+.text-app-secondary {
+  color: var(--text-secondary);
+}
+.text-app-accent {
+  color: var(--accent-color);
+}
+.bg-app-accent {
+  background-color: var(--accent-color);
+}
+.bg-app-accent-subtle {
+  background-color: var(--accent-subtle);
+}
+.ring-app-accent {
+  --tw-ring-color: var(--ring-color);
+}
+
+/* Clarification Amber & Speculative Violet Tokens */
+.text-app-amber {
+  color: var(--amber-clarification);
+}
+.bg-app-amber-subtle {
+  background-color: var(--amber-subtle);
+}
+.border-app-amber {
+  border-color: var(--amber-clarification);
+}
+
+.text-app-violet {
+  color: var(--violet-speculative);
+}
+.bg-app-violet-subtle {
+  background-color: var(--violet-subtle);
+}
+.border-app-violet {
+  border-color: var(--violet-speculative);
+}
+
+.text-app-cyan {
+  color: var(--secondary-glow);
+}
+.bg-app-cyan-subtle {
+  background-color: var(--secondary-subtle);
+}
+.border-app-cyan {
+  border-color: var(--secondary-glow);
+}
+
+.text-app-red {
+  color: var(--error-red);
+}
+.bg-app-red-subtle {
+  background-color: var(--error-subtle);
+}
+.border-app-red {
+  border-color: var(--error-red);
+}
+
+/* Tabular Numerals for Durations and Timestamps */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(146, 156, 169, 0.22);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(146, 156, 169, 0.4);
+}
+
+/* Pulse keyframes for live recording */
+@keyframes recordPulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(1.18);
+  }
+}
+
+.animate-record-pulse {
+  animation: recordPulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Subtle breathing glow for standby mic */
+@keyframes micBreathe {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(190, 255, 83, 0);
+  }
+  50% {
+    box-shadow: 0 0 24px 2px rgba(190, 255, 83, 0.22);
+  }
+}
+
+.animate-mic-breathe {
+  animation: micBreathe 4s ease-in-out infinite;
+}
+
+/* Orbital rotation for AI processing centerpiece */
+@keyframes orbitSpin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes orbitSpinReverse {
+  0% {
+    transform: rotate(360deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+.animate-orbit-spin {
+  animation: orbitSpin 14s linear infinite;
+}
+
+.animate-orbit-reverse {
+  animation: orbitSpinReverse 18s linear infinite;
+}
+
+@keyframes radarSweep {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-radar-sweep {
+  animation: radarSweep 3s linear infinite;
+}
+
+/* Accessibility: Respect user reduced motion preference or explicit toggle */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.reduced-motion *, .reduced-motion ::before, .reduced-motion ::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
