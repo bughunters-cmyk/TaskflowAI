@@ -26,7 +26,7 @@ export async function PATCH(
 
     const resolvedTask: ConfirmedTask = {
       id: `task_promoted_${clarificationId}`,
-      meeting_id: 'meeting_001',
+      meeting_id: body.meeting_id || 'meeting_001',
       title: 'Resolved Commitment: Hackathon Demo Coordination & Staging Validation',
       description: `Ownership confirmed and assigned to ${assignee.name}. Responsible for end-to-end rehearsal and staging environment readiness.`,
       assignee_id: assignee.id,
@@ -52,3 +52,5 @@ export async function PATCH(
     );
   }
 }
+
+export const POST = PATCH;

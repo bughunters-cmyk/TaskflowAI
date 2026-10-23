@@ -157,7 +157,11 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const updateTask = (meetingId: string, taskId: string, updates: Partial<ConfirmedTask>) => {
     setMeetings((prev) =>
       prev.map((m) => {
+<<<<<<< HEAD
         if (m.id !== meetingId) return m;
+=======
+        if (m.id !== meetingId && prev.length > 1) return m;
+>>>>>>> 7df27aad51e3d79311c887aa7e5939b5e5b4575d
         return {
           ...m,
           confirmed_tasks: m.confirmed_tasks.map((t) => {
@@ -294,7 +298,11 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       if (result.success && result.resolved_task) {
         setMeetings((prev) =>
           prev.map((m) => {
+<<<<<<< HEAD
             if (m.id !== meetingId) return m;
+=======
+            if (m.id !== meetingId && prev.length > 1) return m;
+>>>>>>> 7df27aad51e3d79311c887aa7e5939b5e5b4575d
 
             // Remove or mark clarification resolved
             const updatedClarifications = m.clarifications_needed.map((c) =>

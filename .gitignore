@@ -1,19 +1,10 @@
-# Environment secrets (crucial to exclude)
 .env
-*_env
-
-# Node.js dependencies & builds
+.env.*
+!.env.example
 node_modules/
 .next/
-*.zip
-
-# Python environments & cache
 venv/
 __pycache__/
 *.pyc
-
-# IDE local settings
-.vscode/
-
-tictac.c
-main2.py
+*.wav
+*.mp3
