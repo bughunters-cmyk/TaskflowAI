@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-import { OverviewDashboard } from '@/components/dashboard/overview-dashboard';
-
-export default function HomePage() {
-  return <OverviewDashboard />;
-=======
 'use client';
 
 import { useState, useEffect } from 'react';
@@ -180,5 +174,5 @@ export default function Home() {
       </div>
     </main>
   );
->>>>>>> 7df27aad51e3d79311c887aa7e5939b5e5b4575d
+
 }
