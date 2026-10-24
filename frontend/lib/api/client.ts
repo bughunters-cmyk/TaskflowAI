@@ -226,7 +226,7 @@ class ZiroApiClient {
       const stored = localStorage.getItem('ziro_api_base_url');
       if (stored) return stored.replace(/\/$/, '');
     }
-    return (process.env.NEXT_PUBLIC_API_BASE_URL || '').replace(/\/$/, '');
+    return (process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || 'https://ziroai-hackathon.onrender.com').replace(/\/$/, '');
   }
 
   public isDemoMode(): boolean {
