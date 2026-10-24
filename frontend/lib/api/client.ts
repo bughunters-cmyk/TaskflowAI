@@ -243,7 +243,7 @@ class ZiroApiClient {
   async checkHealth(): Promise<{ status: string; trello_configured?: boolean; mode?: string } | null> {
     try {
       const baseUrl = this.getBaseUrl();
-      const res = await fetch(`${baseUrl || ''}/api/health`, { method: 'GET', signal: AbortSignal.timeout(4000) });
+      const res = await fetch(`${baseUrl || ''}/api/health`, { method: 'GET', signal: AbortSignal.timeout(60000) });
       if (res.ok) return await res.json();
     } catch {}
     return null;
@@ -632,7 +632,7 @@ class ZiroApiClient {
   async getTrelloMembers(): Promise<Participant[]> {
     try {
       const baseUrl = this.getBaseUrl();
-      const res = await fetch(`${baseUrl}/api/trello/members`, { signal: AbortSignal.timeout(4000) });
+      const res = await fetch(`${baseUrl}/api/trello/members`, { signal: AbortSignal.timeout(60000) });
       if (res.ok) {
         const members = await res.json();
         if (Array.isArray(members) && members.length > 0) {
