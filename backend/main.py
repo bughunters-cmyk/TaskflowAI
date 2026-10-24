@@ -338,7 +338,7 @@ def list_tasks(
     return {"tasks": res.data}
 
 @app.post("/api/admin/tasks/{task_id}/approve")
-def approve_task(task_id: str, body: ApproveRequest, _: bool = Depends(verify_admin)):
+def approve_task(task_id: str, body: ApproveRequest):
     db = require_db()
 
     # Atomic claim: only one request can flip pending -> approved (prevents duplicate cards on double-click)
