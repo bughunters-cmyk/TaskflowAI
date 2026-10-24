@@ -408,7 +408,7 @@ class ZiroApiClient {
       if (response.ok) {
         const uploadResult = await response.json();
         // If audio was duplicate/reused, or returned with meeting detail
-        if (uploadResult.reused || (uploadResult.tasks && uploadResult.tasks.length > 0)) {
+        if (uploadResult.reused || uploadResult.tasks !== undefined || uploadResult.transcript !== undefined) {
           return normalizeMeetingData(uploadResult);
         }
 
