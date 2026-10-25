@@ -18,6 +18,7 @@ export function formatDate(dateString: string): string {
       month: "short",
       day: "numeric",
       year: "numeric",
+      timeZone: "UTC",
     });
   } catch {
     return dateString;
@@ -31,6 +32,7 @@ export function formatTime(dateString: string): string {
       hour: "numeric",
       minute: "2-digit",
       hour12: true,
+      timeZone: "UTC",
     });
   } catch {
     return "";
