@@ -379,9 +379,6 @@ class ZiroApiClient {
 
     const formData = new FormData();
     formData.append('file', audioBlob, filename);
-    formData.append('title', filename.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ') || 'Live Recorded Meeting');
-    formData.append('meeting_at', new Date().toISOString());
-    formData.append('timezone_name', Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kolkata');
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
