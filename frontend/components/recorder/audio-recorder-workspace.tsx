@@ -47,6 +47,7 @@ export function AudioRecorderWorkspace() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [justSwitchedDevice, setJustSwitchedDevice] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadedFileRef = useRef<File | null>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
 
   // Sync audio player time
@@ -100,7 +101,17 @@ export function AudioRecorderWorkspace() {
   };
 
   const handleUploadAndAnalyze = async () => {
-    if (!recorder.wavBlob) return;
+    const targetBlob = recorder.wavBlob || uploadedFileRef.current;
+    const targetFilename = recorder.wavFilename || uploadedFileRef.current?.name || 'meeting_recording.wav';
+
+    if (!targetBlob) {
+      addToast({
+        title: 'No Audio File Found',
+        message: 'Please select an audio file or record audio before analyzing.',
+        type: 'warning',
+      });
+      return;
+    }
 
     recorder.setStatus('processing');
     setProcessingStage(0);
@@ -116,8 +127,8 @@ export function AudioRecorderWorkspace() {
 
     try {
       const analyzedMeeting = await ziroApi.analyzeAudio(
-        recorder.wavBlob,
-        recorder.wavFilename,
+        targetBlob,
+        targetFilename,
         undefined,
         isDemoMode
       );
@@ -167,7 +178,7 @@ export function AudioRecorderWorkspace() {
     }
   };
 
-  const handleSelectedFile = (file: File) => {
+  const handleSelectedFile = async (file: File) => {
     const validExtensions = ['.wav', '.mp3', '.m4a', '.webm', '.ogg', '.flac'];
     const nameLower = file.name.toLowerCase();
     const isValid = validExtensions.some((ext) => nameLower.endsWith(ext));
@@ -181,12 +192,18 @@ export function AudioRecorderWorkspace() {
       return;
     }
 
-    recorder.loadAudioFile(file);
-    addToast({
-      title: 'Audio File Loaded',
-      message: `Loaded ${file.name} (${Math.round(file.size / 1024)} KB).`,
-      type: 'info',
-    });
+    uploadedFileRef.current = file;
+
+    try {
+      await recorder.loadAudioFile(file);
+      addToast({
+        title: 'Audio File Loaded',
+        message: `Loaded ${file.name} (${Math.round(file.size / 1024)} KB).`,
+        type: 'info',
+      });
+    } catch {
+      recorder.setStatus('recorded');
+    }
   };
 
   // If in processing, success, or processing-error state, show dedicated AI Processing Deck!
