@@ -108,7 +108,7 @@ export function AudioRecorderWorkspace() {
       addToast({
         title: 'No Audio File Found',
         message: 'Please select an audio file or record audio before analyzing.',
-        type: 'warning',
+        type: 'error',
       });
       return;
     }
