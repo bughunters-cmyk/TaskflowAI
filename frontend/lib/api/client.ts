@@ -2,7 +2,7 @@ import { Meeting, ConfirmedTask, ClarificationNeeded, Participant, TranscriptSeg
 import { ApproveTaskResponse, ResolveClarificationResponse } from '@/types/api';
 import { INITIAL_MEETINGS, MOCK_PARTICIPANTS, MOCK_SEGMENTS_001 } from '@/lib/data/mock-meetings';
 
-const DEFAULT_TIMEOUT_MS = 35000;
+const DEFAULT_TIMEOUT_MS = 120000;
 
 export class ApiError extends Error {
   status?: number;
@@ -234,7 +234,7 @@ class ZiroApiClient {
       const stored = localStorage.getItem('ziro_demo_mode');
       if (stored !== null) return stored === 'true';
     }
-    return true; // Default to demo mode for guaranteed hackathon reliability
+    return false; // Default to live backend mode
   }
 
   /**
