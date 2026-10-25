@@ -51,7 +51,7 @@ const LOCAL_STORAGE_TRELLO_KEY = 'ziro_trello_config_v2';
 export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const [meetings, setMeetings] = useState<Meeting[]>(INITIAL_MEETINGS);
   const [currentMeetingId, setCurrentMeetingId] = useState<string>('meeting_001');
-  const [isDemoMode, setIsDemoModeState] = useState<boolean>(true); // default true for rock-solid hackathon experience
+  const [isDemoMode, setIsDemoModeState] = useState<boolean>(false);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [activeInspectorTask, setActiveInspectorTask] = useState<ConfirmedTask | null>(null);
