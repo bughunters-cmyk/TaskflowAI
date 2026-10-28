@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import json
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 from pathlib import Path
@@ -29,7 +30,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")          # service_role key recommended for backend
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # from Supabase → Settings → API → JWT Secret
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
 FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")]
 
@@ -68,22 +69,33 @@ def get_current_user(
     if not credentials:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     token = credentials.credentials
-    if not SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=503, detail="JWT secret not configured")
 
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token: no sub")
-        return CurrentUser(id=user_id, email=payload.get("email"))
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    # 1) Fast path: verify locally with the legacy HS256 JWT secret
+    if SUPABASE_JWT_SECRET:
+        try:
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+            user_id = payload.get("sub")
+            if user_id:
+                return CurrentUser(id=user_id, email=payload.get("email"))
+        except JWTError as e:
+            print(f"ℹ️ Local JWT verify failed ({e}); trying Supabase auth server")
+
+    # 2) Fallback: ask Supabase to validate the token (works with ES256/RS256 signing keys too)
+    if supabase:
+        try:
+            res = supabase.auth.get_user(token)
+            if res and res.user:
+                return CurrentUser(id=res.user.id, email=res.user.email)
+        except Exception as e:
+            print(f"❌ Supabase get_user failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    raise HTTPException(status_code=503, detail="Auth not configured (set SUPABASE_JWT_SECRET or SUPABASE_URL/KEY)")
 
 def require_db() -> Client:
     if not supabase:
@@ -114,6 +126,10 @@ def assert_firm_member(user_id: str, firm_id: str, db: Client, require_admin: bo
         raise HTTPException(status_code=403, detail="Not a member of this firm")
     if require_admin and q.data[0]["role"] not in ("owner", "admin"):
         raise HTTPException(status_code=403, detail="Admin or owner role required")
+    return q.data[0]["role"]
+
+def generate_invite_code() -> str:
+    return secrets.token_urlsafe(6).replace("-", "x").replace("_", "y").upper()[:8]
 
 # ------------------------------------------------------------------
 # Schemas
@@ -145,7 +161,8 @@ class CreateFirmRequest(BaseModel):
     slug: Optional[str] = None
 
 class JoinFirmRequest(BaseModel):
-    slug: str
+    invite_code: Optional[str] = None
+    slug: Optional[str] = None   # legacy alias: the value is treated as the invite code
 
 class TrelloConfigCreate(BaseModel):
     firm_id: str
@@ -295,7 +312,7 @@ def create_firm(body: CreateFirmRequest, user: CurrentUser = Depends(get_current
 
     firm = (
         db.table("firms")
-        .insert({"name": body.name, "slug": slug, "created_by": user.id})
+        .insert({"name": body.name, "slug": slug, "created_by": user.id, "invite_code": generate_invite_code()})
         .execute()
         .data[0]
     )
@@ -310,7 +327,7 @@ def list_my_firms(user: CurrentUser = Depends(get_current_user)):
     db = require_db()
     res = (
         db.table("firm_members")
-        .select("role, status, firm:firms(id, name, slug, created_at)")
+        .select("role, status, firm:firms(id, name, slug, invite_code, created_at)")
         .eq("user_id", user.id)
         .eq("status", "active")
         .execute()
@@ -320,9 +337,12 @@ def list_my_firms(user: CurrentUser = Depends(get_current_user)):
 @app.post("/api/firms/join")
 def join_firm(body: JoinFirmRequest, user: CurrentUser = Depends(get_current_user)):
     db = require_db()
-    firm_res = db.table("firms").select("id").eq("slug", body.slug).limit(1).execute()
+    code = (body.invite_code or body.slug or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="Invite code required")
+    firm_res = db.table("firms").select("id").eq("invite_code", code).limit(1).execute()
     if not firm_res.data:
-        raise HTTPException(status_code=404, detail="Firm not found")
+        raise HTTPException(status_code=404, detail="Invalid invite code")
     firm_id = firm_res.data[0]["id"]
 
     # already member?
@@ -349,6 +369,12 @@ def join_firm(body: JoinFirmRequest, user: CurrentUser = Depends(get_current_use
 @app.post("/api/firms/{firm_id}/leave")
 def leave_firm(firm_id: str, user: CurrentUser = Depends(get_current_user)):
     db = require_db()
+    my_role = assert_firm_member(user.id, firm_id, db)
+    if my_role == "owner":
+        owners = db.table("firm_members").select("user_id").eq("firm_id", firm_id).eq("role", "owner").eq("status", "active").execute().data or []
+        others = db.table("firm_members").select("user_id").eq("firm_id", firm_id).eq("status", "active").neq("user_id", user.id).execute().data or []
+        if len(owners) <= 1 and others:
+            raise HTTPException(status_code=400, detail="You are the only owner. Promote another owner before leaving.")
     res = (
         db.table("firm_members")
         .update({"status": "removed"})
@@ -383,10 +409,21 @@ def update_member_role(
     user: CurrentUser = Depends(get_current_user),
 ):
     db = require_db()
-    assert_firm_member(user.id, firm_id, db, require_admin=True)
-    if member_user_id == user.id and body.role != "owner":
-        # prevent last owner from demoting themselves easily – optional safeguard
-        pass
+    caller_role = assert_firm_member(user.id, firm_id, db, require_admin=True)
+    target = (
+        db.table("firm_members").select("role")
+        .eq("firm_id", firm_id).eq("user_id", member_user_id).eq("status", "active")
+        .limit(1).execute().data
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found")
+    target_role = target[0]["role"]
+    if (body.role == "owner" or target_role == "owner") and caller_role != "owner":
+        raise HTTPException(status_code=403, detail="Only an owner can grant or change the owner role")
+    if target_role == "owner" and body.role != "owner":
+        owners = db.table("firm_members").select("user_id").eq("firm_id", firm_id).eq("role", "owner").eq("status", "active").execute().data or []
+        if len(owners) <= 1:
+            raise HTTPException(status_code=400, detail="A firm must keep at least one owner")
     res = (
         db.table("firm_members")
         .update({"role": body.role})
@@ -406,9 +443,16 @@ def kick_member(
     user: CurrentUser = Depends(get_current_user),
 ):
     db = require_db()
-    assert_firm_member(user.id, firm_id, db, require_admin=True)
+    caller_role = assert_firm_member(user.id, firm_id, db, require_admin=True)
     if member_user_id == user.id:
         raise HTTPException(status_code=400, detail="Use /leave instead of kicking yourself")
+    target = (
+        db.table("firm_members").select("role")
+        .eq("firm_id", firm_id).eq("user_id", member_user_id).eq("status", "active")
+        .limit(1).execute().data
+    )
+    if target and target[0]["role"] == "owner" and caller_role != "owner":
+        raise HTTPException(status_code=403, detail="Only an owner can remove an owner")
     res = (
         db.table("firm_members")
         .update({"status": "removed"})
@@ -420,6 +464,23 @@ def kick_member(
     if not res.data:
         raise HTTPException(status_code=404, detail="Member not found")
     return {"status": "kicked"}
+
+@app.get("/api/firms/{firm_id}/invite-code")
+def get_invite_code(firm_id: str, user: CurrentUser = Depends(get_current_user)):
+    db = require_db()
+    assert_firm_member(user.id, firm_id, db, require_admin=True)
+    res = db.table("firms").select("invite_code").eq("id", firm_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Firm not found")
+    return {"invite_code": res.data[0].get("invite_code")}
+
+@app.post("/api/firms/{firm_id}/invite-code/regenerate")
+def regenerate_invite_code(firm_id: str, user: CurrentUser = Depends(get_current_user)):
+    db = require_db()
+    assert_firm_member(user.id, firm_id, db, require_admin=True)
+    code = generate_invite_code()
+    db.table("firms").update({"invite_code": code}).eq("id", firm_id).execute()
+    return {"invite_code": code}
 
 # ------------------------------------------------------------------
 # Trello configs (per firm)
@@ -483,7 +544,7 @@ async def process_audio(
 
     # Dedup per firm
     existing = (
-        db.table("audio_hashes")
+        db.table("audio_hashes_v2")
         .select("hash")
         .eq("firm_id", firm_id)
         .eq("hash", audio_hash)
@@ -492,7 +553,7 @@ async def process_audio(
     if existing.data:
         return TaskExtractionResponse(status="duplicate", transcript="[Duplicate Audio Detected]", tasks=[])
 
-    db.table("audio_hashes").insert({"firm_id": firm_id, "hash": audio_hash}).execute()
+    db.table("audio_hashes_v2").insert({"firm_id": firm_id, "hash": audio_hash}).execute()
 
     transcript = ""
     clean_mime = (file.content_type or "audio/wav").split(";")[0]
@@ -716,7 +777,7 @@ def approve_task(
         .execute()
     )
     if not claim.data:
-        raise HTTPException(status_code=409, detail=f"Task already {task['status']}")
+        raise HTTPException(status_code=409, detail="Task already reviewed")
 
     final_task = body.task or task["task"]
     final_owner = body.owner or task.get("owner") or "Unassigned"

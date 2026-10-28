@@ -70,6 +70,26 @@ function SettingsContent() {
     }
   };
 
+  const regenerateCode = async () => {
+    if (!token || !firmId) return;
+    if (!confirm("Generate a new invite code? The old one will stop working.")) return;
+    setLoading(true);
+    setMsg("");
+    try {
+      await apiFetch(
+        `/api/firms/${firmId}/invite-code/regenerate`,
+        { method: "POST" },
+        token
+      );
+      await refreshFirms();
+      setMsg("New invite code generated");
+    } catch (err: any) {
+      setMsg(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const kick = async (userId: string) => {
     if (!token || !firmId || !confirm("Remove this member?")) return;
     try {
@@ -101,18 +121,29 @@ function SettingsContent() {
         <CardContent>
           <div className="flex items-center gap-3">
             <code className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-brand-400">
-              {currentFirm.slug}
+              {currentFirm.invite_code ?? "—"}
             </code>
             <Button
               size="sm"
               variant="secondary"
               onClick={() => {
-                navigator.clipboard.writeText(currentFirm.slug);
+                if (!currentFirm.invite_code) return;
+                navigator.clipboard.writeText(currentFirm.invite_code);
                 setMsg("Copied!");
               }}
             >
               Copy
             </Button>
+            {isAdmin && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={regenerateCode}
+                loading={loading}
+              >
+                New code
+              </Button>
+            )}
           </div>
           <p className="text-xs text-slate-500 mt-2">
             Share this code so teammates can join your firm

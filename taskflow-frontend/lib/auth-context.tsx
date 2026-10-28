@@ -15,6 +15,7 @@ interface Firm {
   id: string;
   name: string;
   slug: string;
+  invite_code: string | null;
   role: string;
 }
 
@@ -34,7 +35,8 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [firmsLoaded, setFirmsLoaded] = useState(false);
   const [firms, setFirms] = useState<Firm[]>([]);
   const [currentFirm, setCurrentFirmState] = useState<Firm | null>(null);
 
@@ -48,6 +50,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         id: m.firm.id,
         name: m.firm.name,
         slug: m.firm.slug,
+        invite_code: m.firm.invite_code ?? null,
         role: m.role,
       }));
       setFirms(list);
@@ -61,9 +64,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
       }
-      if (list.length > 0 && !currentFirm) {
+      if (list.length > 0) {
         setCurrentFirmState(list[0]);
         localStorage.setItem("taskflow_current_firm", list[0].id);
+      } else {
+        setCurrentFirmState(null);
       }
     } catch (e) {
       console.error("Failed to load firms", e);
@@ -83,7 +88,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       setUser(session?.user ?? null);
-      setLoading(false);
+      setSessionLoading(false);
     });
 
     const {
@@ -91,7 +96,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
       setUser(session?.user ?? null);
-      setLoading(false);
+      setSessionLoading(false);
     });
 
     return () => subscription.unsubscribe();
@@ -99,10 +104,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (session?.access_token) {
-      refreshFirms();
+      refreshFirms().finally(() => setFirmsLoaded(true));
     } else {
       setFirms([]);
       setCurrentFirmState(null);
+      setFirmsLoaded(false);
     }
   }, [session?.access_token]);
 
@@ -111,6 +117,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setCurrentFirm(null);
     localStorage.removeItem("taskflow_current_firm");
   };
+
+  // "loading" stays true until the session is known AND (if signed in) the
+  // firm list has been fetched, so the onboarding screen never flashes.
+  const loading = sessionLoading || (!!session && !firmsLoaded);
 
   return (
     <AuthContext.Provider
