@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import secrets
+import time
+import traceback
 from datetime import datetime, timezone
 from typing import List, Optional
 from pathlib import Path
@@ -11,12 +13,13 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import requests
 from supabase import create_client, Client
 from jose import jwt, JWTError
-from uuid import uuid4
+from uuid import uuid4, UUID
 
 # ------------------------------------------------------------------
 # Environment
@@ -32,10 +35,20 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")          # service_role key recommended
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # from Supabase → Settings → API → JWT Secret
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
-FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")]
+FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")]
 
 # Optional global super-admin key (for emergency)
 SUPER_ADMIN_KEY = os.getenv("SUPER_ADMIN_KEY")
+
+# --- v1.1 (single-tenant) compatibility settings ---
+TRELLO_API_KEY = os.getenv("TRELLO_API_KEY")          # global Trello board used by the legacy approval queue
+TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
+TRELLO_LIST_ID = os.getenv("TRELLO_LIST_ID")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")          # legacy: x-api-secret header for audio/text submissions
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")            # legacy: x-admin-key header for the admin approval queue
+ENABLE_LEGACY_V1 = os.getenv("ENABLE_LEGACY_V1", "true").strip().lower() in ("1", "true", "yes", "on")
+MAX_AUDIO_MB = float(os.getenv("MAX_AUDIO_MB", "25"))        # upload size cap (Groq Whisper accepts up to ~25 MB)
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "100000"))  # pasted-transcript size cap
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -45,6 +58,20 @@ if SUPABASE_URL and SUPABASE_KEY:
         print(f"⚠️ Supabase initialization failed: {e}")
 
 app = FastAPI(title="TaskFlow AI – Multi-tenant Backend", version="2.0")
+
+# Registered BEFORE the CORS middleware so it sits inside it: unexpected crashes are logged with a full
+# traceback in this terminal and come back as a normal JSON error WITH CORS headers. (Without this the browser
+# only shows a confusing "blocked by CORS / Failed to fetch" and hides the real problem.)
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+@app.middleware("http")
+async def catch_unhandled_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        traceback.print_exc()
+        detail = f"Server error: {type(e).__name__}: {str(e)[:300]}" if DEBUG_ERRORS else "Internal server error"
+        return JSONResponse(status_code=500, content={"detail": detail})
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,13 +90,26 @@ class CurrentUser(BaseModel):
     id: str
     email: Optional[str] = None
 
+_AUTH_CACHE: dict = {}
+_AUTH_CACHE_TTL = 60  # seconds a verified token is trusted without re-checking
+
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> CurrentUser:
     if not credentials:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     token = credentials.credentials
+    now = time.monotonic()
+    hit = _AUTH_CACHE.get(token)
+    if hit and hit[0] > now:
+        return hit[1]
+    user = _verify_token(token)
+    if len(_AUTH_CACHE) > 1000:
+        _AUTH_CACHE.clear()
+    _AUTH_CACHE[token] = (now + _AUTH_CACHE_TTL, user)
+    return user
 
+def _verify_token(token: str) -> CurrentUser:
     # 1) Fast path: verify locally with the legacy HS256 JWT secret
     if SUPABASE_JWT_SECRET:
         try:
@@ -112,7 +152,14 @@ def get_user_firm_ids(user_id: str, db: Client) -> List[str]:
     )
     return [r["firm_id"] for r in (res.data or [])]
 
+def ensure_uuid(value, what: str = "Item") -> str:
+    try:
+        return str(UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=404, detail=f"{what} not found")
+
 def assert_firm_member(user_id: str, firm_id: str, db: Client, require_admin: bool = False):
+    firm_id = ensure_uuid(firm_id, "Firm")
     q = (
         db.table("firm_members")
         .select("role, status")
@@ -181,6 +228,20 @@ class ApproveRequest(BaseModel):
 class RejectRequest(BaseModel):
     reason: Optional[str] = None
 
+class LegacyTextRequest(BaseModel):
+    text: str
+
+class LegacyApproveRequest(BaseModel):
+    # Optional admin edits applied at approval time (v1.1)
+    task: Optional[str] = None
+    owner: Optional[str] = None
+    due_date: Optional[str] = None
+    reviewed_by: Optional[str] = "admin"
+
+class LegacyRejectRequest(BaseModel):
+    reason: Optional[str] = None
+    reviewed_by: Optional[str] = "admin"
+
 class UpdateMemberRoleRequest(BaseModel):
     role: str = Field(..., pattern="^(owner|admin|member)$")
 
@@ -211,7 +272,12 @@ def parse_llm_json(raw_text: str) -> dict:
         cleaned = cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
-    return json.loads(cleaned.strip())
+    data = json.loads(cleaned.strip())
+    if isinstance(data, list):          # model returned a bare list of tasks
+        data = {"tasks": data}
+    if not isinstance(data, dict):
+        raise ValueError("LLM did not return a JSON object")
+    return data
 
 def call_llm_extraction(transcript: str) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -234,12 +300,17 @@ def call_llm_extraction(transcript: str) -> dict:
 
     if GEMINI_API_KEY:
         try:
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
             payload = {
                 "contents": [{"parts": [{"text": f"{system_prompt}\n\nTranscript:\n{transcript}"}]}],
                 "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1},
             }
-            resp = requests.post(gemini_url, headers={"Content-Type": "application/json"}, json=payload, timeout=25)
+            resp = requests.post(
+                gemini_url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                json=payload,
+                timeout=25,
+            )
             if resp.status_code == 200:
                 raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 return parse_llm_json(raw_text)
@@ -291,11 +362,13 @@ def create_trello_card(
     if due_date:
         params["due"] = f"{due_date}T12:00:00.000Z"
     try:
-        resp = requests.post("https://api.trello.com/1/cards", params=params, timeout=15)
+        # credentials go in the POST body, never in the URL (URLs end up in exception messages and logs)
+        resp = requests.post("https://api.trello.com/1/cards", data=params, timeout=15)
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Trello network error: {e}")
+        print(f"❌ Trello network error: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail="Could not reach Trello. Please try again.")
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Trello API error ({resp.status_code}): {resp.text}")
+        raise HTTPException(status_code=502, detail=f"Trello API error ({resp.status_code}): {resp.text[:300]}")
     return resp.json()
 
 # ------------------------------------------------------------------
@@ -316,10 +389,14 @@ def create_firm(body: CreateFirmRequest, user: CurrentUser = Depends(get_current
         .execute()
         .data[0]
     )
-    # add creator as owner
-    db.table("firm_members").insert(
-        {"firm_id": firm["id"], "user_id": user.id, "role": "owner", "status": "active"}
-    ).execute()
+    # add creator as owner (undo the firm if this fails so we never leave an ownerless firm behind)
+    try:
+        db.table("firm_members").insert(
+            {"firm_id": firm["id"], "user_id": user.id, "role": "owner", "status": "active"}
+        ).execute()
+    except Exception as e:
+        db.table("firms").delete().eq("id", firm["id"]).execute()
+        raise HTTPException(status_code=500, detail=f"Could not create firm: {e}")
     return firm
 
 @app.get("/api/firms")
@@ -465,6 +542,53 @@ def kick_member(
         raise HTTPException(status_code=404, detail="Member not found")
     return {"status": "kicked"}
 
+
+@app.delete("/api/firms/{firm_id}")
+def delete_firm(firm_id: str, user: CurrentUser = Depends(get_current_user)):
+    """
+    Permanently delete a firm and all related data.
+    Only the owner can do this. This cannot be undone.
+    """
+    db = require_db()
+    firm_id = ensure_uuid(firm_id, "Firm")
+
+    membership = (
+        db.table("firm_members")
+        .select("role, status")
+        .eq("firm_id", firm_id)
+        .eq("user_id", user.id)
+        .eq("status", "active")
+        .limit(1)
+        .execute()
+    )
+    if not membership.data:
+        raise HTTPException(status_code=403, detail="Not a member of this firm")
+    if membership.data[0]["role"] != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner can delete this firm")
+
+    firm = db.table("firms").select("id, name").eq("id", firm_id).limit(1).execute()
+    if not firm.data:
+        raise HTTPException(status_code=404, detail="Firm not found")
+
+    # Delete related rows first (safe even if FK cascade is already set)
+    for table in ("tasks", "meetings", "firm_trello_configs", "audio_hashes_v2", "firm_members"):
+        try:
+            db.table(table).delete().eq("firm_id", firm_id).execute()
+        except Exception as e:
+            print(f"⚠️ Cleanup {table}: {e}")
+
+    try:
+        db.table("audio_hashes").delete().eq("firm_id", firm_id).execute()
+    except Exception:
+        pass
+
+    deleted = db.table("firms").delete().eq("id", firm_id).execute()
+    if not deleted.data:
+        raise HTTPException(status_code=500, detail="Failed to delete firm")
+
+    return {"status": "deleted", "firm_id": firm_id, "name": firm.data[0]["name"]}
+
+
 @app.get("/api/firms/{firm_id}/invite-code")
 def get_invite_code(firm_id: str, user: CurrentUser = Depends(get_current_user)):
     db = require_db()
@@ -525,60 +649,95 @@ def list_trello_configs(firm_id: str, user: CurrentUser = Depends(get_current_us
 # ------------------------------------------------------------------
 # Submission endpoints (scoped)
 # ------------------------------------------------------------------
-@app.post("/api/process-audio", response_model=TaskExtractionResponse)
-async def process_audio(
-    file: UploadFile = File(...),
-    firm_id: str = Query(...),
-    title: Optional[str] = Query(None),
-    user: CurrentUser = Depends(get_current_user),
-):
-    db = require_db()
-    assert_firm_member(user.id, firm_id, db)
+_AUDIO_EXT_TO_MIME = {
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".mpga": "audio/mpeg", ".mpeg": "audio/mpeg",
+    ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".webm": "audio/webm", ".ogg": "audio/ogg",
+    ".oga": "audio/ogg", ".flac": "audio/flac", ".aac": "audio/aac",
+}
+_AUDIO_MIME_TO_EXT = {
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/vnd.wave": ".wav",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mpeg3": ".mp3", "audio/x-mpeg-3": ".mp3",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a", "video/mp4": ".mp4",
+    "audio/aac": ".aac", "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/ogg": ".ogg", "application/ogg": ".ogg", "audio/flac": ".flac", "audio/x-flac": ".flac",
+}
 
+def prepare_audio_meta(filename: Optional[str], content_type: Optional[str]):
+    """Returns (filename_with_valid_extension, mime). Browser recordings often arrive as a nameless 'blob'
+    with only a content type; STT providers pick the decoder from the file extension, so we must set one."""
+    name = (filename or "").strip() or "recording"
+    ext = os.path.splitext(name)[1].lower()
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if ext not in _AUDIO_EXT_TO_MIME:
+        ext_from_mime = _AUDIO_MIME_TO_EXT.get(mime)
+        if not ext_from_mime:
+            raise HTTPException(
+                status_code=415,
+                detail="Unsupported audio format. Use WAV, MP3, M4A, MP4, OGG, FLAC or WebM (browser recording).",
+            )
+        name = os.path.splitext(name)[0] + ext_from_mime
+        ext = ext_from_mime
+    if mime not in _AUDIO_MIME_TO_EXT:
+        mime = _AUDIO_EXT_TO_MIME[ext]
+    return name, mime
+
+def read_audio_upload(file: UploadFile) -> bytes:
+    limit = int(MAX_AUDIO_MB * 1024 * 1024)
     try:
-        audio_bytes = await file.read()
+        data = file.file.read(limit + 1)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+    if not data:
+        raise HTTPException(status_code=400, detail="The audio file is empty")
+    if len(data) > limit:
+        raise HTTPException(status_code=413, detail=f"Audio file too large (max {MAX_AUDIO_MB:g} MB)")
+    return data
 
-    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+def claim_audio_hash(db: Client, firm_id: str, audio_hash: str) -> bool:
+    """Atomically reserve this audio for the firm. True = new audio, False = already processed.
+    Relies on the UNIQUE (firm_id, hash) constraint, so two simultaneous uploads cannot both win."""
+    try:
+        db.table("audio_hashes_v2").insert({"firm_id": firm_id, "hash": audio_hash}).execute()
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        if "duplicate" in msg or "23505" in msg or "unique" in msg:
+            return False
+        raise HTTPException(status_code=500, detail=f"Could not record audio fingerprint: {e}")
 
-    # Dedup per firm
-    existing = (
-        db.table("audio_hashes_v2")
-        .select("hash")
-        .eq("firm_id", firm_id)
-        .eq("hash", audio_hash)
-        .execute()
-    )
-    if existing.data:
-        return TaskExtractionResponse(status="duplicate", transcript="[Duplicate Audio Detected]", tasks=[])
+def release_audio_hash(db: Client, firm_id: str, audio_hash: str) -> None:
+    """Undo a claim when processing failed, so the same file can be retried."""
+    try:
+        db.table("audio_hashes_v2").delete().eq("firm_id", firm_id).eq("hash", audio_hash).execute()
+    except Exception as e:
+        print(f"⚠️ Could not release audio hash: {e}")
 
-    db.table("audio_hashes_v2").insert({"firm_id": firm_id, "hash": audio_hash}).execute()
-
+def transcribe_audio(audio_bytes: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
+    """Speech-to-text: Sarvam first, Groq Whisper as fallback. Returns '' if nothing was transcribed."""
     transcript = ""
-    clean_mime = (file.content_type or "audio/wav").split(";")[0]
+    filename, clean_mime = prepare_audio_meta(filename, content_type)
 
     if SARVAM_API_KEY:
         try:
             resp = requests.post(
                 "https://api.sarvam.ai/speech-to-text-translate",
                 headers={"api-subscription-key": SARVAM_API_KEY},
-                files={"file": (file.filename, audio_bytes, clean_mime)},
+                files={"file": (filename, audio_bytes, clean_mime)},
                 timeout=45,
             )
             if resp.status_code == 200:
                 transcript = resp.json().get("transcript", "")
             else:
-                print(f"⚠️ Sarvam STT failed ({resp.status_code})")
+                print(f"⚠️ Sarvam STT failed ({resp.status_code}). Falling back to Groq...")
         except Exception as e:
-            print(f"⚠️ Sarvam error: {e}")
+            print(f"⚠️ Sarvam API network error: {e}. Falling back to Groq...")
 
     if not transcript and GROQ_API_KEY:
         try:
             resp = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": (file.filename, audio_bytes, clean_mime)},
+                files={"file": (filename, audio_bytes, clean_mime)},
                 data={"model": "whisper-large-v3-turbo"},
                 timeout=30,
             )
@@ -589,30 +748,66 @@ async def process_audio(
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"STT Pipeline failed: {e}")
+            raise HTTPException(status_code=500, detail=f"STT Pipeline failed entirely: {e}")
 
-    if not transcript:
-        return TaskExtractionResponse(status="success", transcript="", tasks=[])
+    return transcript
 
-    # Create meeting
-    meeting = (
-        db.table("meetings")
-        .insert({
-            "firm_id": firm_id,
-            "user_id": user.id,
-            "title": title or file.filename or "Untitled Meeting",
-            "transcript": transcript,
-            "audio_hash": audio_hash,
-        })
-        .execute()
-        .data[0]
-    )
+@app.post("/api/process-audio", response_model=TaskExtractionResponse)
+def process_audio(
+    file: UploadFile = File(...),
+    firm_id: str = Query(...),
+    title: Optional[str] = Query(None),
+    user: CurrentUser = Depends(get_current_user),
+):
+    # NOTE: a plain `def` (not `async def`) on purpose. FastAPI runs it in a worker thread, so the many seconds
+    # spent in speech-to-text / LLM calls do not freeze every other request (logins, dashboards, ...).
+    db = require_db()
+    assert_firm_member(user.id, firm_id, db)
+    firm_id = ensure_uuid(firm_id, "Firm")
 
-    tasks = extract_and_queue(transcript, firm_id, user.id, meeting["id"], db)
+    audio_bytes = read_audio_upload(file)
+    name, mime = prepare_audio_meta(file.filename, file.content_type)
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+    # Dedup per firm (atomic). Reserved up front, and released again if anything below fails.
+    if not claim_audio_hash(db, firm_id, audio_hash):
+        return TaskExtractionResponse(status="duplicate", transcript="[Duplicate Audio Detected]", tasks=[])
+
+    meeting_id = None
+    try:
+        transcript = transcribe_audio(audio_bytes, name, mime)
+        if not transcript.strip():
+            release_audio_hash(db, firm_id, audio_hash)
+            return TaskExtractionResponse(status="success", transcript="", tasks=[])
+
+        meeting = (
+            db.table("meetings")
+            .insert({
+                "firm_id": firm_id,
+                "user_id": user.id,
+                "title": title or file.filename or "Recording",
+                "transcript": transcript,
+                "audio_hash": audio_hash,
+            })
+            .execute()
+            .data[0]
+        )
+        meeting_id = meeting["id"]
+        tasks = extract_and_queue(transcript, firm_id, user.id, meeting_id, db)
+    except Exception:
+        # Failed part-way: remove the half-made meeting and free the hash so a retry works.
+        if meeting_id:
+            try:
+                db.table("meetings").delete().eq("id", meeting_id).execute()
+            except Exception as ce:
+                print(f"⚠️ Could not clean up meeting {meeting_id}: {ce}")
+        release_audio_hash(db, firm_id, audio_hash)
+        raise
+
     return TaskExtractionResponse(
         status="success",
         transcript=transcript,
-        meeting_id=meeting["id"],
+        meeting_id=meeting_id,
         tasks=tasks,
     )
 
@@ -623,6 +818,8 @@ def process_text(req: TextExtractionRequest, user: CurrentUser = Depends(get_cur
 
     if not req.text.strip():
         return TaskExtractionResponse(status="success", transcript="", tasks=[])
+    if len(req.text) > MAX_TEXT_CHARS:
+        raise HTTPException(status_code=413, detail=f"Transcript too long (max {MAX_TEXT_CHARS:,} characters)")
 
     meeting = (
         db.table("meetings")
@@ -636,7 +833,14 @@ def process_text(req: TextExtractionRequest, user: CurrentUser = Depends(get_cur
         .data[0]
     )
 
-    tasks = extract_and_queue(req.text, req.firm_id, user.id, meeting["id"], db)
+    try:
+        tasks = extract_and_queue(req.text, req.firm_id, user.id, meeting["id"], db)
+    except Exception:
+        try:
+            db.table("meetings").delete().eq("id", meeting["id"]).execute()
+        except Exception as ce:
+            print(f"⚠️ Could not clean up meeting {meeting['id']}: {ce}")
+        raise
     return TaskExtractionResponse(
         status="success",
         transcript=req.text,
@@ -652,6 +856,8 @@ def extract_and_queue(
     db: Client,
 ) -> List[TaskItem]:
     raw_tasks = call_llm_extraction(transcript).get("tasks", [])
+    if not isinstance(raw_tasks, list):
+        raw_tasks = []
     rows = []
     for t in raw_tasks:
         if isinstance(t, dict) and t.get("task"):
@@ -714,6 +920,7 @@ def list_meetings(
 @app.get("/api/meetings/{meeting_id}")
 def get_meeting(meeting_id: str, user: CurrentUser = Depends(get_current_user)):
     db = require_db()
+    meeting_id = ensure_uuid(meeting_id, "Meeting")
     res = db.table("meetings").select("*").eq("id", meeting_id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -754,6 +961,7 @@ def approve_task(
     user: CurrentUser = Depends(get_current_user),
 ):
     db = require_db()
+    task_id = ensure_uuid(task_id, "Task")
 
     # Load task
     task_res = db.table("tasks").select("*").eq("id", task_id).limit(1).execute()
@@ -763,6 +971,8 @@ def approve_task(
     firm_id = task["firm_id"]
 
     assert_firm_member(user.id, firm_id, db, require_admin=True)
+    if body.trello_config_id:
+        ensure_uuid(body.trello_config_id, "Trello board")
 
     # Atomic claim
     claim = (
@@ -786,7 +996,14 @@ def approve_task(
     # Resolve Trello config
     trello_config_id = body.trello_config_id or task.get("trello_config_id")
     if trello_config_id:
-        cfg_res = db.table("firm_trello_configs").select("*").eq("id", trello_config_id).limit(1).execute()
+        cfg_res = (
+            db.table("firm_trello_configs")
+            .select("*")
+            .eq("id", trello_config_id)
+            .eq("firm_id", firm_id)      # only this firm's own boards
+            .limit(1)
+            .execute()
+        )
     else:
         cfg_res = (
             db.table("firm_trello_configs")
@@ -820,7 +1037,7 @@ def approve_task(
             cfg["api_key"], cfg["token"], cfg["list_id"],
             final_task, final_owner, final_due, task.get("evidence") or "",
         )
-    except HTTPException:
+    except Exception:
         db.table("tasks").update({
             "status": "pending", "reviewed_by": None, "reviewed_at": None
         }).eq("id", task_id).execute()
@@ -848,6 +1065,7 @@ def reject_task(
     user: CurrentUser = Depends(get_current_user),
 ):
     db = require_db()
+    task_id = ensure_uuid(task_id, "Task")
     task_res = db.table("tasks").select("firm_id, status").eq("id", task_id).limit(1).execute()
     if not task_res.data:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -886,6 +1104,199 @@ def health():
 # ------------------------------------------------------------------
 @app.get("/api/admin/verify")
 def admin_verify(x_admin_key: Optional[str] = Header(None)):
-    if SUPER_ADMIN_KEY and x_admin_key and hmac.compare_digest(x_admin_key, SUPER_ADMIN_KEY):
-        return {"status": "ok", "super_admin": True}
+    """Accepts either the super-admin key (v1.2) or the legacy ADMIN_API_KEY (v1.1)."""
+    if x_admin_key:
+        if SUPER_ADMIN_KEY and hmac.compare_digest(x_admin_key, SUPER_ADMIN_KEY):
+            return {"status": "ok", "super_admin": True}
+        if ADMIN_API_KEY and hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+            return {"status": "ok"}
     raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ==================================================================
+# v1.1 COMPATIBILITY (single-tenant API: pending_tasks + global Trello)
+# Not firm-scoped. Uses the legacy tables pending_tasks / audio_hashes,
+# the global TRELLO_* env vars, and header keys instead of user logins.
+# Turn off entirely with ENABLE_LEGACY_V1=false.
+# ==================================================================
+def require_legacy_enabled():
+    if not ENABLE_LEGACY_V1:
+        raise HTTPException(status_code=404, detail="Not found")
+    return True
+
+def verify_api_secret(x_api_secret: Optional[str] = Header(None)):
+    """Legacy submission gate (x-api-secret). Fails closed if API_SECRET_KEY isn't configured."""
+    if not API_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Legacy submission API not configured (set API_SECRET_KEY).")
+    if not x_api_secret or not hmac.compare_digest(x_api_secret, API_SECRET_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Secret")
+    return True
+
+def verify_admin(x_admin_key: Optional[str] = Header(None)):
+    """Legacy admin gate (x-admin-key). Fails closed if ADMIN_API_KEY isn't configured."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin access not configured on server.")
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid admin key")
+    return True
+
+def legacy_check_and_store_hash(audio_bytes: bytes) -> bool:
+    """True if this audio was already processed (legacy global table)."""
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+    if supabase:
+        try:
+            res = supabase.table("audio_hashes").select("hash").eq("hash", audio_hash).execute()
+            if res.data and len(res.data) > 0:
+                return True
+            supabase.table("audio_hashes").insert({"hash": audio_hash}).execute()
+        except Exception as e:
+            print(f"⚠️ Supabase deduplication error: {e}")
+    return False
+
+def legacy_release_hash(audio_hash: str) -> None:
+    if supabase:
+        try:
+            supabase.table("audio_hashes").delete().eq("hash", audio_hash).execute()
+        except Exception as e:
+            print(f"⚠️ Could not release legacy audio hash: {e}")
+
+def legacy_extract_and_queue(transcript: str) -> List[TaskItem]:
+    """Run LLM extraction and persist each task as 'pending' in the legacy pending_tasks queue."""
+    raw_tasks = call_llm_extraction(transcript).get("tasks", [])
+    rows = []
+    if isinstance(raw_tasks, list):
+        for t in raw_tasks:
+            if isinstance(t, dict) and t.get("task"):
+                rows.append({
+                    "task": t["task"],
+                    "owner": t.get("owner") or "Unassigned",
+                    "due_date": clean_due_date(t.get("due_date")),
+                    "type": t.get("type") if t.get("type") in ("confirmed", "tentative") else "confirmed",
+                    "evidence": t.get("evidence") or "",
+                    "source_transcript": transcript,
+                    "status": "pending",
+                })
+    if not rows:
+        return []
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not configured; cannot queue tasks for approval.")
+    try:
+        saved = supabase.table("pending_tasks").insert(rows).execute().data
+    except Exception as e:
+        print(f"⚠️ Failed to queue tasks: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save tasks to the approval queue: {e}")
+    return [TaskItem(**{k: r.get(k) for k in TaskItem.model_fields if k in r}) for r in saved]
+
+def create_trello_card_global(task: str, owner: str, due_date: Optional[str], evidence: str) -> dict:
+    """Create a card on the single global board configured via TRELLO_API_KEY / TRELLO_TOKEN / TRELLO_LIST_ID."""
+    if not TRELLO_API_KEY or not TRELLO_TOKEN or not TRELLO_LIST_ID:
+        raise HTTPException(status_code=500, detail="Trello API configuration missing.")
+    return create_trello_card(TRELLO_API_KEY, TRELLO_TOKEN, TRELLO_LIST_ID, task, owner, due_date, evidence)
+
+@app.post(
+    "/api/legacy/process-audio",
+    response_model=TaskExtractionResponse,
+    dependencies=[Depends(require_legacy_enabled)],
+)
+def legacy_process_audio(file: UploadFile = File(...), authenticated: bool = Depends(verify_api_secret)):
+    audio_bytes = read_audio_upload(file)
+    name, mime = prepare_audio_meta(file.filename, file.content_type)
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+    if legacy_check_and_store_hash(audio_bytes):
+        return TaskExtractionResponse(status="duplicate", transcript="[Duplicate Audio Detected]", tasks=[])
+
+    try:
+        transcript = transcribe_audio(audio_bytes, name, mime)
+        if not transcript.strip():
+            legacy_release_hash(audio_hash)
+            return TaskExtractionResponse(status="success", transcript="", tasks=[])
+        tasks = legacy_extract_and_queue(transcript)
+    except Exception:
+        legacy_release_hash(audio_hash)   # failed -> allow a retry of the same file
+        raise
+    return TaskExtractionResponse(status="success", transcript=transcript, tasks=tasks)
+
+@app.post(
+    "/api/legacy/process-text",
+    response_model=TaskExtractionResponse,
+    dependencies=[Depends(require_legacy_enabled)],
+)
+def legacy_process_text(req: LegacyTextRequest, authenticated: bool = Depends(verify_api_secret)):
+    if not req.text.strip():
+        return TaskExtractionResponse(status="success", transcript="", tasks=[])
+    return TaskExtractionResponse(status="success", transcript=req.text, tasks=legacy_extract_and_queue(req.text))
+
+@app.get("/api/admin/tasks", dependencies=[Depends(require_legacy_enabled)])
+def legacy_list_tasks(
+    status: str = Query("pending", pattern="^(pending|approved|rejected)$"),
+    _: bool = Depends(verify_admin),
+):
+    db = require_db()
+    res = (
+        db.table("pending_tasks")
+        .select("id,task,owner,due_date,type,evidence,status,trello_card_url,reviewed_by,reviewed_at,rejection_reason,created_at")
+        .eq("status", status)
+        .order("created_at", desc=True)
+        .limit(200)
+        .execute()
+    )
+    return {"tasks": res.data}
+
+@app.post("/api/admin/tasks/{task_id}/approve", dependencies=[Depends(require_legacy_enabled)])
+def legacy_approve_task(task_id: str, body: LegacyApproveRequest, _: bool = Depends(verify_admin)):
+    db = require_db()
+    task_id = ensure_uuid(task_id, "Task")
+
+    # Atomic claim: only one request can flip pending -> approved (prevents duplicate cards on double-click)
+    claim = (
+        db.table("pending_tasks")
+        .update({"status": "approved", "reviewed_by": body.reviewed_by, "reviewed_at": now_iso()})
+        .eq("id", task_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    if not claim.data:
+        exists = db.table("pending_tasks").select("status").eq("id", task_id).execute().data
+        if not exists:
+            raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=409, detail=f"Task already {exists[0]['status']}")
+
+    row = claim.data[0]
+    final_task = body.task or row["task"]
+    final_owner = body.owner or row.get("owner") or "Unassigned"
+    final_due = clean_due_date(body.due_date) if body.due_date else row.get("due_date")
+
+    try:
+        card = create_trello_card_global(final_task, final_owner, final_due, row.get("evidence") or "")
+    except Exception:
+        # Roll back so the admin can retry
+        db.table("pending_tasks").update(
+            {"status": "pending", "reviewed_by": None, "reviewed_at": None}
+        ).eq("id", task_id).execute()
+        raise
+
+    db.table("pending_tasks").update({
+        "task": final_task, "owner": final_owner, "due_date": final_due,
+        "trello_card_id": card.get("id"), "trello_card_url": card.get("url"),
+    }).eq("id", task_id).execute()
+
+    return {"status": "success", "card_id": card.get("id"), "card_url": card.get("url")}
+
+@app.post("/api/admin/tasks/{task_id}/reject", dependencies=[Depends(require_legacy_enabled)])
+def legacy_reject_task(task_id: str, body: LegacyRejectRequest, _: bool = Depends(verify_admin)):
+    db = require_db()
+    task_id = ensure_uuid(task_id, "Task")
+    res = (
+        db.table("pending_tasks")
+        .update({
+            "status": "rejected", "reviewed_by": body.reviewed_by,
+            "reviewed_at": now_iso(), "rejection_reason": body.reason,
+        })
+        .eq("id", task_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=409, detail="Task not found or already reviewed")
+    return {"status": "rejected"}

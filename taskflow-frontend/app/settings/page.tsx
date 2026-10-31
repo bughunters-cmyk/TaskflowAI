@@ -3,13 +3,16 @@
 import { AuthProvider, useAuth } from "@/lib/auth-context";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { apiFetch } from "@/lib/api";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { AlertTriangle } from "lucide-react";
 
 function SettingsContent() {
-  const { session, currentFirm, refreshFirms } = useAuth();
+  const { session, currentFirm, firms, setCurrentFirm, refreshFirms } = useAuth();
+  const router = useRouter();
   const [members, setMembers] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
   const [showTrelloForm, setShowTrelloForm] = useState(false);
@@ -23,10 +26,17 @@ function SettingsContent() {
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
 
+  // delete firm state
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
   const token = session?.access_token;
   const firmId = currentFirm?.id;
   const isAdmin =
     currentFirm?.role === "owner" || currentFirm?.role === "admin";
+  const isOwner = currentFirm?.role === "owner";
 
   useEffect(() => {
     if (!token || !firmId) return;
@@ -38,7 +48,7 @@ function SettingsContent() {
         setMembers(m.members || []);
         setConfigs(c.configs || []);
       })
-      .catch(console.error);
+      .catch((e) => console.error("Settings load error:", e));
   }, [token, firmId]);
 
   const addTrello = async (e: React.FormEvent) => {
@@ -57,11 +67,7 @@ function SettingsContent() {
       );
       setMsg("Trello board connected");
       setShowTrelloForm(false);
-      const c = await apiFetch(
-        `/api/firms/${firmId}/trello-configs`,
-        {},
-        token
-      );
+      const c = await apiFetch(`/api/firms/${firmId}/trello-configs`, {}, token);
       setConfigs(c.configs || []);
     } catch (err: any) {
       setMsg(err.message);
@@ -104,13 +110,39 @@ function SettingsContent() {
     }
   };
 
+  const handleDeleteFirm = async () => {
+    if (!token || !currentFirm || confirmText.trim() !== currentFirm.name) return;
+    setDeleteLoading(true);
+    setDeleteError("");
+    try {
+      await apiFetch(`/api/firms/${currentFirm.id}`, { method: "DELETE" }, token);
+      await refreshFirms();
+      const remaining = firms.filter((f) => f.id !== currentFirm.id);
+      if (remaining.length > 0) {
+        setCurrentFirm(remaining[0]);
+      } else {
+        setCurrentFirm(null);
+      }
+      router.push("/");
+    } catch (err: any) {
+      setDeleteError(err.message || "Failed to delete firm");
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
   if (!currentFirm) return null;
 
   return (
     <div className="space-y-8 max-w-2xl">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-        <p className="text-slate-400 text-sm mt-1">{currentFirm.name}</p>
+        <p className="text-slate-400 text-sm mt-1">
+          {currentFirm.name}
+          <span className="ml-2 text-xs text-slate-500 capitalize">
+            · your role: {currentFirm.role}
+          </span>
+        </p>
       </div>
 
       {/* Invite code */}
@@ -135,12 +167,7 @@ function SettingsContent() {
               Copy
             </Button>
             {isAdmin && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={regenerateCode}
-                loading={loading}
-              >
+              <Button size="sm" variant="ghost" onClick={regenerateCode} loading={loading}>
                 New code
               </Button>
             )}
@@ -163,19 +190,13 @@ function SettingsContent() {
               className="flex items-center justify-between py-2 border-b border-slate-800 last:border-0"
             >
               <div>
-                <div className="text-sm font-medium">
-                  {m.user_id.slice(0, 8)}…
-                </div>
+                <div className="text-sm font-medium">{m.user_id.slice(0, 8)}…</div>
                 <div className="text-xs text-slate-500 capitalize">
                   {m.role} · {m.status}
                 </div>
               </div>
               {isAdmin && m.role !== "owner" && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => kick(m.user_id)}
-                >
+                <Button size="sm" variant="ghost" onClick={() => kick(m.user_id)}>
                   Remove
                 </Button>
               )}
@@ -199,9 +220,7 @@ function SettingsContent() {
           </CardHeader>
           <CardContent className="space-y-3">
             {configs.length === 0 && !showTrelloForm && (
-              <p className="text-sm text-slate-500">
-                No Trello boards connected yet
-              </p>
+              <p className="text-sm text-slate-500">No Trello boards connected yet</p>
             )}
             {configs.map((c) => (
               <div
@@ -223,33 +242,25 @@ function SettingsContent() {
                 <Input
                   label="Board name"
                   value={trelloForm.name}
-                  onChange={(e) =>
-                    setTrelloForm({ ...trelloForm, name: e.target.value })
-                  }
+                  onChange={(e) => setTrelloForm({ ...trelloForm, name: e.target.value })}
                   required
                 />
                 <Input
                   label="Trello API Key"
                   value={trelloForm.api_key}
-                  onChange={(e) =>
-                    setTrelloForm({ ...trelloForm, api_key: e.target.value })
-                  }
+                  onChange={(e) => setTrelloForm({ ...trelloForm, api_key: e.target.value })}
                   required
                 />
                 <Input
                   label="Trello Token"
                   value={trelloForm.token}
-                  onChange={(e) =>
-                    setTrelloForm({ ...trelloForm, token: e.target.value })
-                  }
+                  onChange={(e) => setTrelloForm({ ...trelloForm, token: e.target.value })}
                   required
                 />
                 <Input
                   label="List ID"
                   value={trelloForm.list_id}
-                  onChange={(e) =>
-                    setTrelloForm({ ...trelloForm, list_id: e.target.value })
-                  }
+                  onChange={(e) => setTrelloForm({ ...trelloForm, list_id: e.target.value })}
                   required
                 />
                 <Button type="submit" loading={loading}>
@@ -265,6 +276,75 @@ function SettingsContent() {
         <div className="text-sm text-brand-400 bg-brand-500/10 border border-brand-500/20 rounded-lg px-4 py-2">
           {msg}
         </div>
+      )}
+
+      {/* Danger zone — owner only */}
+      {isOwner && (
+        <div className="rounded-lg border border-red-500/20 bg-red-500/[0.04]">
+          <div className="border-b border-red-500/10 px-4 py-3">
+            <h2 className="text-[13px] font-medium text-red-400">Danger zone</h2>
+          </div>
+          <div className="px-4 py-4 space-y-3">
+            <p className="text-[13px] text-slate-400 leading-relaxed">
+              Deleting <span className="font-medium text-slate-200">{currentFirm.name}</span>{" "}
+              permanently removes all meetings, tasks, members, and Trello connections.
+              This cannot be undone.
+            </p>
+
+            {!deleteOpen ? (
+              <Button variant="danger" size="sm" onClick={() => setDeleteOpen(true)}>
+                Delete this firm
+              </Button>
+            ) : (
+              <div className="space-y-3 rounded-md border border-red-500/20 bg-slate-950 p-3">
+                <div className="flex items-start gap-2 text-[12px] text-amber-400/90">
+                  <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                  <span>
+                    Type <strong className="text-slate-200">{currentFirm.name}</strong> to confirm.
+                  </span>
+                </div>
+                <input
+                  value={confirmText}
+                  onChange={(e) => setConfirmText(e.target.value)}
+                  placeholder={currentFirm.name}
+                  className="w-full h-9 rounded-md border border-slate-700 bg-transparent px-3 text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-red-500/40 focus:outline-none"
+                  autoComplete="off"
+                />
+                {deleteError && (
+                  <p className="text-[12px] text-red-400">{deleteError}</p>
+                )}
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setDeleteOpen(false);
+                      setConfirmText("");
+                      setDeleteError("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    disabled={confirmText.trim() !== currentFirm.name}
+                    loading={deleteLoading}
+                    onClick={handleDeleteFirm}
+                  >
+                    Permanently delete
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!isOwner && (
+        <p className="text-xs text-slate-500">
+          Only the firm owner can delete this firm. Your role: {currentFirm.role}
+        </p>
       )}
     </div>
   );

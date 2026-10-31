@@ -6,7 +6,7 @@ import { useEffect } from "react";
 import { Sidebar } from "./sidebar";
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {
-  const { user, loading, firms, currentFirm } = useAuth();
+  const { user, loading, firms } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
@@ -17,10 +17,10 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-surface-950">
+      <div className="flex min-h-screen items-center justify-center bg-[#070b12]">
         <div className="flex flex-col items-center gap-3">
-          <div className="w-8 h-8 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-slate-400">Loading…</p>
+          <div className="h-7 w-7 animate-spin rounded-full border-2 border-emerald-500 border-t-transparent" />
+          <p className="text-sm text-slate-500">Loading…</p>
         </div>
       </div>
     );
@@ -28,20 +28,15 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   if (!user) return null;
 
-  // No firm yet → redirect to firm onboarding
   if (firms.length === 0) {
-    return (
-      <div className="min-h-screen bg-surface-950">
-        {children}
-      </div>
-    );
+    return <div className="min-h-screen bg-[#070b12]">{children}</div>;
   }
 
   return (
-    <div className="min-h-screen bg-surface-950">
+    <div className="min-h-screen bg-[#070b12]">
       <Sidebar />
-      <main className="pl-60 min-h-screen">
-        <div className="max-w-6xl mx-auto px-6 py-8">{children}</div>
+      <main className="min-h-screen pl-[240px]">
+        <div className="mx-auto max-w-5xl px-8 py-8">{children}</div>
       </main>
     </div>
   );
