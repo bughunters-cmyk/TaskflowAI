@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { formatRelative } from "@/lib/utils";
 import Link from "next/link";
+import { LiveRecorder } from "@/components/dashboard/live-recorder";
 
 export function OverviewPage() {
   const { session, currentFirm } = useAuth();
@@ -126,7 +127,7 @@ export function OverviewPage() {
   const name = session?.user?.email?.split("@")[0] || "there";
 
   return (
-    <div className="space-y-8">
+        <div className="space-y-8">
       {/* Header */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
@@ -167,6 +168,14 @@ export function OverviewPage() {
         </div>
       </div>
 
+      {/* Live mic — AFTER the header block */}
+      <LiveRecorder
+        onDone={({ message }) => {
+          setMessage({ type: "ok", text: message });
+          loadData();
+        }}
+      />
+      
       {/* Paste transcript panel */}
       {showText && (
         <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
