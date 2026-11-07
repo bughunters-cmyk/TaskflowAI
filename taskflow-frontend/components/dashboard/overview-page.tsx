@@ -2,36 +2,75 @@
 
 import { useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { apiFetch, apiUpload } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Mic,
   ListTodo,
   CheckCircle2,
-  AlertCircle,
   Upload,
   FileText,
   ArrowRight,
+  Sparkles,
 } from "lucide-react";
-import { formatRelative } from "@/lib/utils";
 import Link from "next/link";
-import { LiveRecorder } from "@/components/dashboard/live-recorder";
+
+// Prefer shared util; fall back if the project utils file is incomplete
+function formatRelativeSafe(date: string) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { formatRelative } = require("@/lib/utils");
+    if (typeof formatRelative === "function") return formatRelative(date);
+  } catch {
+    /* ignore */
+  }
+  const d = new Date(date);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString();
+}
+
+function getGreeting() {
+  const h = new Date().getHours();
+  if (h < 12) return "morning";
+  if (h < 17) return "afternoon";
+  return "evening";
+}
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+async function uploadAudio(path: string, formData: FormData, token: string) {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Upload failed");
+  }
+  return res.json();
+}
 
 export function OverviewPage() {
-  const { session, currentFirm } = useAuth();
-  const [stats, setStats] = useState({
-    meetings: 0,
-    pending: 0,
-    approved: 0,
-  });
+  const { session, currentFirm, firms } = useAuth();
+  const [stats, setStats] = useState({ meetings: 0, pending: 0, approved: 0 });
   const [recentMeetings, setRecentMeetings] = useState<any[]>([]);
   const [uploading, setUploading] = useState(false);
   const [textInput, setTextInput] = useState("");
   const [showText, setShowText] = useState(false);
   const [message, setMessage] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const [LiveRec, setLiveRec] = useState<null | React.ComponentType<any>>(null);
 
   const token = session?.access_token;
   const firmId = currentFirm?.id;
+  const name = session?.user?.email?.split("@")[0] || "there";
+
+  // Load LiveRecorder only if the file exists — never crash Overview if it's missing
+  useEffect(() => {
+    import("@/components/dashboard/live-recorder")
+      .then((m) => setLiveRec(() => m.LiveRecorder))
+      .catch(() => setLiveRec(null));
+  }, []);
 
   const loadData = async () => {
     if (!token || !firmId) return;
@@ -64,7 +103,7 @@ export function OverviewPage() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await apiUpload(
+      const res = await uploadAudio(
         `/api/process-audio?firm_id=${firmId}&title=${encodeURIComponent(file.name)}`,
         fd,
         token
@@ -118,73 +157,79 @@ export function OverviewPage() {
 
   if (!currentFirm) {
     return (
-      <div className="py-24 text-center text-sm text-slate-500">
-        Select or create a firm to get started
+      <div className="space-y-4 py-16 text-center">
+        <p className="text-sm text-slate-400">
+          {firms?.length
+            ? "Select a firm from the sidebar switcher."
+            : "No firm selected. Create or join a firm from Settings / Firms."}
+        </p>
+        <Link href="/settings" className="text-sm text-emerald-400 hover:underline">
+          Go to Settings
+        </Link>
       </div>
     );
   }
 
-  const name = session?.user?.email?.split("@")[0] || "there";
-
   return (
-        <div className="space-y-8">
-      {/* Header */}
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[22px] font-semibold tracking-tight text-white">
-            Good {getGreeting()}, {name}
-          </h1>
-          <p className="mt-1 text-[13px] text-slate-500">
-            {currentFirm.name} · Turn conversations into clear action items
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <label className="cursor-pointer">
-            <input
-              type="file"
-              accept="audio/*"
-              className="hidden"
-              onChange={handleAudioUpload}
-              disabled={uploading}
-            />
-            <span className="inline-flex h-9 items-center gap-2 rounded-md bg-emerald-500 px-3.5 text-[13px] font-medium text-white shadow-sm shadow-emerald-500/20 transition hover:bg-emerald-600">
-              {uploading ? (
-                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
-              ) : (
-                <Upload className="h-3.5 w-3.5" />
-              )}
-              Upload recording
-            </span>
-          </label>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => setShowText((v) => !v)}
-            className="h-9"
-          >
-            <FileText className="h-3.5 w-3.5" />
-            Paste transcript
-          </Button>
+    <div className="space-y-8">
+      <div className="relative overflow-hidden rounded-2xl border border-white/[0.06] bg-gradient-to-br from-emerald-500/[0.08] via-transparent to-sky-500/[0.05] p-6 md:p-8">
+        <div className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-emerald-500/10 blur-3xl" />
+        <div className="relative flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <div className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-400">
+              <Sparkles className="h-3 w-3" />
+              {currentFirm.name}
+            </div>
+            <h1 className="text-[26px] font-semibold tracking-tight text-white md:text-[28px]">
+              Good {getGreeting()}, {name}
+            </h1>
+            <p className="mt-1.5 max-w-md text-[13px] text-slate-400">
+              Capture meetings, extract action items, and push them to Trello.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="cursor-pointer">
+              <input
+                type="file"
+                accept="audio/*"
+                className="hidden"
+                onChange={handleAudioUpload}
+                disabled={uploading}
+              />
+              <span className="inline-flex h-10 items-center gap-2 rounded-lg bg-emerald-500 px-4 text-[13px] font-medium text-white hover:bg-emerald-600">
+                {uploading ? (
+                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                ) : (
+                  <Upload className="h-3.5 w-3.5" />
+                )}
+                Upload recording
+              </span>
+            </label>
+            <Button variant="secondary" size="sm" onClick={() => setShowText((v) => !v)} className="h-10">
+              <FileText className="h-3.5 w-3.5" />
+              Paste transcript
+            </Button>
+          </div>
         </div>
       </div>
 
-      {/* Live mic — AFTER the header block */}
-      <LiveRecorder
-        onDone={({ message }) => {
-          setMessage({ type: "ok", text: message });
-          loadData();
-        }}
-      />
-      
-      {/* Paste transcript panel */}
+      {LiveRec && (
+        <LiveRec
+          onDone={({ message: msg }: { message: string }) => {
+            setMessage({ type: "ok", text: msg });
+            loadData();
+          }}
+        />
+      )}
+
       {showText && (
-        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
           <textarea
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
-            placeholder="Paste meeting notes or a transcript…"
+            placeholder="Paste meeting notes…"
             rows={5}
-            className="w-full resize-none rounded-md border border-white/[0.08] bg-[#0a0e17] px-3 py-2.5 text-[13px] text-slate-200 placeholder:text-slate-600 focus:border-emerald-500/50 focus:outline-none focus:ring-1 focus:ring-emerald-500/30"
+            className="w-full resize-none rounded-lg border border-white/[0.08] bg-[#07090f] px-3 py-2.5 text-[13px] text-slate-200 placeholder:text-slate-600 focus:border-emerald-500/40 focus:outline-none"
           />
           <div className="mt-3 flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => setShowText(false)}>
@@ -197,94 +242,57 @@ export function OverviewPage() {
         </div>
       )}
 
-      {/* Status message */}
       {message && (
         <div
           className={
             message.type === "ok"
-              ? "rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3.5 py-2.5 text-[13px] text-emerald-400"
-              : "rounded-md border border-red-500/20 bg-red-500/10 px-3.5 py-2.5 text-[13px] text-red-400"
+              ? "rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-2.5 text-[13px] text-emerald-400"
+              : "rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-2.5 text-[13px] text-red-400"
           }
         >
           {message.text}
         </div>
       )}
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-        <StatCard
-          icon={Mic}
-          label="Meetings"
-          value={stats.meetings}
-          accent="text-sky-400"
-          accentBg="bg-sky-400/10"
-        />
-        <StatCard
-          icon={ListTodo}
-          label="Pending review"
-          value={stats.pending}
-          accent="text-amber-400"
-          accentBg="bg-amber-400/10"
-        />
-        <StatCard
-          icon={CheckCircle2}
-          label="Approved"
-          value={stats.approved}
-          accent="text-emerald-400"
-          accentBg="bg-emerald-400/10"
-        />
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <Stat icon={Mic} label="Meetings" value={stats.meetings} />
+        <Stat icon={ListTodo} label="Pending review" value={stats.pending} />
+        <Stat icon={CheckCircle2} label="Approved" value={stats.approved} />
       </div>
 
-      {/* Recent meetings */}
       <section>
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-[13px] font-medium text-slate-400">Recent meetings</h2>
-          {recentMeetings.length > 0 && (
-            <Link
-              href="/meetings"
-              className="inline-flex items-center gap-1 text-[12px] text-slate-500 transition hover:text-slate-300"
-            >
-              View all
-              <ArrowRight className="h-3 w-3" />
-            </Link>
-          )}
+          <Link href="/meetings" className="inline-flex items-center gap-1 text-[12px] text-slate-500 hover:text-emerald-400">
+            View all <ArrowRight className="h-3 w-3" />
+          </Link>
         </div>
 
         {recentMeetings.length === 0 ? (
-          <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-white/[0.08] py-14 text-center">
-            <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-white/[0.04]">
-              <Mic className="h-4 w-4 text-slate-500" />
-            </div>
-            <p className="text-[13px] font-medium text-slate-400">No meetings yet</p>
-            <p className="mt-1 max-w-xs text-[12px] text-slate-600">
-              Upload a recording or paste a transcript to extract action items.
-            </p>
+          <div className="rounded-2xl border border-dashed border-white/[0.08] py-16 text-center">
+            <p className="text-[14px] font-medium text-slate-300">No meetings yet</p>
+            <p className="mt-1 text-[12px] text-slate-500">Upload audio or paste a transcript to start.</p>
           </div>
         ) : (
-          <div className="overflow-hidden rounded-lg border border-white/[0.06]">
+          <div className="overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.02]">
             {recentMeetings.map((m, i) => (
               <div
                 key={m.id}
                 className={
-                  "flex items-center gap-4 px-4 py-3.5 transition hover:bg-white/[0.02] " +
+                  "flex items-center gap-4 px-4 py-3.5 " +
                   (i !== 0 ? "border-t border-white/[0.04]" : "")
                 }
               >
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-white/[0.04]">
-                  <Mic className="h-3.5 w-3.5 text-slate-400" />
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-400">
+                  <Mic className="h-4 w-4" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] font-medium text-slate-200">
+                  <div className="truncate text-[13px] font-medium text-slate-100">
                     {m.title || "Untitled meeting"}
                   </div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
-                    {formatRelative(m.created_at)}
+                    {formatRelativeSafe(m.created_at)}
                   </div>
-                </div>
-                <div className="hidden max-w-[280px] truncate text-[12px] text-slate-500 sm:block">
-                  {m.transcript
-                    ? m.transcript.slice(0, 80) + (m.transcript.length > 80 ? "…" : "")
-                    : "No transcript"}
                 </div>
               </div>
             ))}
@@ -295,39 +303,26 @@ export function OverviewPage() {
   );
 }
 
-function StatCard({
+function Stat({
   icon: Icon,
   label,
   value,
-  accent,
-  accentBg,
 }: {
   icon: any;
   label: string;
   value: number;
-  accent: string;
-  accentBg: string;
 }) {
   return (
-    <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-4">
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
       <div className="flex items-center gap-3">
-        <div className={`flex h-8 w-8 items-center justify-center rounded-md ${accentBg}`}>
-          <Icon className={`h-4 w-4 ${accent}`} strokeWidth={1.75} />
+        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-400">
+          <Icon className="h-4 w-4" />
         </div>
         <div>
-          <div className="text-[20px] font-semibold tabular-nums leading-none text-white">
-            {value}
-          </div>
+          <div className="text-[22px] font-semibold tabular-nums leading-none text-white">{value}</div>
           <div className="mt-1 text-[11px] text-slate-500">{label}</div>
         </div>
       </div>
     </div>
   );
-}
-
-function getGreeting() {
-  const h = new Date().getHours();
-  if (h < 12) return "morning";
-  if (h < 17) return "afternoon";
-  return "evening";
 }

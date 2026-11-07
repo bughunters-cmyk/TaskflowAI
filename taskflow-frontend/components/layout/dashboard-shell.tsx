@@ -17,10 +17,10 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#070b12]">
+      <div className="app-bg flex min-h-screen items-center justify-center">
         <div className="flex flex-col items-center gap-3">
-          <div className="h-7 w-7 animate-spin rounded-full border-2 border-emerald-500 border-t-transparent" />
-          <p className="text-sm text-slate-500">Loading…</p>
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-emerald-500 border-t-transparent" />
+          <p className="text-sm text-slate-500">Loading workspace…</p>
         </div>
       </div>
     );
@@ -29,14 +29,17 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
   if (!user) return null;
 
   if (firms.length === 0) {
-    return <div className="min-h-screen bg-[#070b12]">{children}</div>;
+    return <div className="app-bg min-h-screen">{children}</div>;
   }
 
   return (
-    <div className="min-h-screen bg-[#070b12]">
+    <div className="app-bg min-h-screen">
       <Sidebar />
-      <main className="min-h-screen pl-[240px]">
-        <div className="mx-auto max-w-5xl px-8 py-8">{children}</div>
+      <main
+        className="min-h-screen transition-[padding] duration-150"
+        style={{ paddingLeft: "var(--sidebar-w, 260px)" }}
+      >
+        <div className="mx-auto max-w-5xl px-6 py-8 md:px-10">{children}</div>
       </main>
     </div>
   );

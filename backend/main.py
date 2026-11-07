@@ -1,5 +1,7 @@
 import os
 import hmac
+import io
+import wave
 import hashlib
 import json
 import re
@@ -25,16 +27,25 @@ from uuid import uuid4, UUID
 # Environment
 # ------------------------------------------------------------------
 env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path=env_path, override=True)   # .env wins over stale shell variables
 
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+def env_clean(name: str) -> Optional[str]:
+    """Read an env var and strip stray spaces / quotes that often sneak in when pasting a key."""
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = v.strip().strip('"').strip("'").strip()
+    return v or None
+
+SARVAM_API_KEY = env_clean("SARVAM_API_KEY")
+GEMINI_API_KEY = env_clean("GEMINI_API_KEY")
+GROQ_API_KEY = env_clean("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")          # service_role key recommended for backend
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # from Supabase → Settings → API → JWT Secret
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b")
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")]
 
 # Optional global super-admin key (for emergency)
@@ -49,6 +60,22 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")            # legacy: x-admin-key head
 ENABLE_LEGACY_V1 = os.getenv("ENABLE_LEGACY_V1", "true").strip().lower() in ("1", "true", "yes", "on")
 MAX_AUDIO_MB = float(os.getenv("MAX_AUDIO_MB", "25"))        # upload size cap (Groq Whisper accepts up to ~25 MB)
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "100000"))  # pasted-transcript size cap
+
+def _key_status(label: str, value: Optional[str]) -> str:
+    if not value:
+        return f"{label}: NOT SET"
+    return f"{label}: set ({value[:4]}...{value[-4:]}, {len(value)} chars)"
+
+print("🔑 " + " | ".join([
+    _key_status("Groq", GROQ_API_KEY),
+    _key_status("Gemini", GEMINI_API_KEY),
+    _key_status("Sarvam", SARVAM_API_KEY),
+]))
+print(f"🔑 .env file: {env_path} ({'found' if env_path.exists() else 'NOT FOUND'})")
+if GROQ_API_KEY and not GROQ_API_KEY.startswith("gsk_"):
+    print("⚠️ GROQ_API_KEY does not start with 'gsk_' - Groq keys always do. Is a different key pasted here?")
+if GEMINI_API_KEY and GEMINI_API_KEY.startswith("gsk_"):
+    print("⚠️ GEMINI_API_KEY looks like a GROQ key (starts with 'gsk_'). The keys may be swapped.")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -712,25 +739,80 @@ def release_audio_hash(db: Client, firm_id: str, audio_hash: str) -> None:
     except Exception as e:
         print(f"⚠️ Could not release audio hash: {e}")
 
+SARVAM_MAX_SECONDS = 28   # Sarvam's synchronous API rejects audio longer than 30 s
+
+def split_wav(audio_bytes: bytes, max_seconds: int) -> Optional[List[bytes]]:
+    """Cut a PCM .wav into chunks of at most max_seconds. Returns None if it isn't a readable PCM wav."""
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as w:
+            params = w.getparams()
+            per_chunk = int(w.getframerate() * max_seconds)
+            total = w.getnframes()
+            if per_chunk <= 0 or total <= 0:
+                return None
+            chunks = []
+            for start in range(0, total, per_chunk):
+                w.setpos(start)
+                frames = w.readframes(min(per_chunk, total - start))
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as out:
+                    out.setparams(params)
+                    out.writeframes(frames)
+                chunks.append(buf.getvalue())
+            return chunks
+    except Exception:
+        return None
+
+def _sarvam_transcribe(name: str, data: bytes, mime: str) -> Optional[str]:
+    """One Sarvam call. Returns the text, or None on any failure (reason is printed to the terminal)."""
+    try:
+        resp = requests.post(
+            "https://api.sarvam.ai/speech-to-text-translate",
+            headers={"api-subscription-key": SARVAM_API_KEY},
+            files={"file": (name, data, mime)},
+            timeout=45,
+        )
+    except Exception as e:
+        print(f"⚠️ Sarvam network error: {type(e).__name__}: {e}")
+        return None
+    if resp.status_code != 200:
+        print(f"⚠️ Sarvam STT failed ({resp.status_code}): {resp.text[:300]}")
+        return None
+    return (resp.json().get("transcript") or "")
+
 def transcribe_audio(audio_bytes: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
-    """Speech-to-text: Sarvam first, Groq Whisper as fallback. Returns '' if nothing was transcribed."""
+    """Speech-to-text: Sarvam first (long WAVs are split into <30 s pieces), Groq Whisper as fallback.
+    Returns '' only when the audio genuinely contained no speech; real failures raise an HTTP error."""
+    if not SARVAM_API_KEY and not GROQ_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="No speech-to-text key configured. Set SARVAM_API_KEY and/or GROQ_API_KEY in the backend .env.",
+        )
+
     transcript = ""
+    sarvam_failed = False
     filename, clean_mime = prepare_audio_meta(filename, content_type)
 
     if SARVAM_API_KEY:
-        try:
-            resp = requests.post(
-                "https://api.sarvam.ai/speech-to-text-translate",
-                headers={"api-subscription-key": SARVAM_API_KEY},
-                files={"file": (filename, audio_bytes, clean_mime)},
-                timeout=45,
-            )
-            if resp.status_code == 200:
-                transcript = resp.json().get("transcript", "")
+        chunks = split_wav(audio_bytes, SARVAM_MAX_SECONDS) if clean_mime == "audio/wav" else None
+        if chunks and len(chunks) > 1:
+            parts = []
+            for i, chunk in enumerate(chunks, start=1):
+                text = _sarvam_transcribe(f"part{i}.wav", chunk, "audio/wav")
+                if text is None:
+                    parts = None
+                    break
+                parts.append(text.strip())
+            if parts is None:
+                sarvam_failed = True
             else:
-                print(f"⚠️ Sarvam STT failed ({resp.status_code}). Falling back to Groq...")
-        except Exception as e:
-            print(f"⚠️ Sarvam API network error: {e}. Falling back to Groq...")
+                transcript = " ".join(t for t in parts if t)
+        else:
+            text = _sarvam_transcribe(filename, audio_bytes, clean_mime)
+            if text is None:
+                sarvam_failed = True
+            else:
+                transcript = text
 
     if not transcript and GROQ_API_KEY:
         try:
@@ -738,17 +820,26 @@ def transcribe_audio(audio_bytes: bytes, filename: Optional[str], content_type: 
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 files={"file": (filename, audio_bytes, clean_mime)},
-                data={"model": "whisper-large-v3-turbo"},
-                timeout=30,
+                data={"model": GROQ_WHISPER_MODEL},
+                timeout=60,
             )
-            if resp.status_code == 200:
-                transcript = resp.json().get("text", "")
-            else:
-                raise HTTPException(status_code=500, detail=f"Groq STT failed: {resp.text}")
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"STT Pipeline failed entirely: {e}")
+            print(f"❌ Groq network error: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=502, detail=f"Speech-to-text failed: could not reach Groq ({type(e).__name__}).")
+        if resp.status_code == 200:
+            transcript = resp.json().get("text", "") or ""
+        else:
+            print(f"❌ Groq STT failed ({resp.status_code}): {resp.text[:500]}")
+            hint = "Sarvam also failed. " if sarvam_failed else ""
+            raise HTTPException(
+                status_code=502,
+                detail=f"Speech-to-text failed. {hint}Groq returned {resp.status_code}: {resp.text[:200]}",
+            )
+    elif not transcript and sarvam_failed:
+        raise HTTPException(
+            status_code=502,
+            detail="Speech-to-text failed (Sarvam error - see the backend terminal). Add GROQ_API_KEY to enable the fallback.",
+        )
 
     return transcript
 
@@ -1098,6 +1189,55 @@ def me(user: CurrentUser = Depends(get_current_user)):
 @app.get("/health")
 def health():
     return {"status": "ok", "multi_tenant": True}
+
+@app.get("/health/providers")
+def health_providers():
+    """Dev helper: checks whether the Groq / Gemini keys are accepted. Never returns the keys themselves.
+    Disabled when DEBUG_ERRORS=false."""
+    if not DEBUG_ERRORS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    def probe(name: str, key: Optional[str], url: str, headers: dict) -> dict:
+        if not key:
+            return {"configured": False, "ok": False, "detail": "key not set in .env"}
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+        except Exception as e:
+            return {"configured": True, "ok": False, "detail": f"could not reach {name}: {type(e).__name__}"}
+        if r.status_code == 200:
+            return {"configured": True, "ok": True, "detail": "key accepted"}
+        return {"configured": True, "ok": False, "status": r.status_code, "detail": r.text[:200]}
+
+    groq = probe("Groq", GROQ_API_KEY, "https://api.groq.com/openai/v1/models",
+                 {"Authorization": f"Bearer {GROQ_API_KEY}"})
+    if groq.get("ok"):
+        # also confirm the model names in .env still exist for this key (models get retired)
+        try:
+            r = requests.get("https://api.groq.com/openai/v1/models",
+                             headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=10)
+            models = r.json().get("data", [])
+            ids = {m.get("id") for m in models}
+            text_models = sorted(
+                m["id"] for m in models
+                if "text" in (m.get("output_modalities") or []) and "text" in (m.get("input_modalities") or [])
+                and "guard" not in m["id"] and "safeguard" not in m["id"]
+            )
+            groq["llm_model"] = GROQ_LLM_MODEL
+            groq["llm_model_available"] = GROQ_LLM_MODEL in ids
+            groq["whisper_model"] = GROQ_WHISPER_MODEL
+            groq["whisper_model_available"] = GROQ_WHISPER_MODEL in ids
+            groq["text_models_you_can_use"] = text_models
+            if GROQ_LLM_MODEL not in ids:
+                groq["detail"] = f"key accepted, BUT model '{GROQ_LLM_MODEL}' is not available - set GROQ_LLM_MODEL in .env to one of text_models_you_can_use"
+        except Exception:
+            pass
+
+    return {
+        "groq": groq,
+        "gemini": probe("Gemini", GEMINI_API_KEY, "https://generativelanguage.googleapis.com/v1beta/models",
+                        {"x-goog-api-key": GEMINI_API_KEY or ""}),
+        "sarvam": {"configured": bool(SARVAM_API_KEY), "detail": "no free check available; works if transcription runs"},
+    }
 
 # ------------------------------------------------------------------
 # Optional: keep old admin verify for compatibility (super-admin only)
